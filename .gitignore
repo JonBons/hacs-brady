@@ -1,0 +1,11 @@
+/build
+/dist
+
+# Decompiled Brady Express Labels APK — local reference only, never commit.
+/apk/
+/apk_dump/
+
+.pytest_cache/
+__pycache__/
+*.pyc
+.DS_Store

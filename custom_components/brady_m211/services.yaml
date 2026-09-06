@@ -1,0 +1,64 @@
+print_text:
+  name: Print text
+  description: Render a message at 203 dpi and print it on the M211.
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: brady_m211
+    message:
+      required: true
+      example: Rack 7 / Port 24
+      selector:
+        text:
+          multiline: true
+    copies:
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 99
+    length_in:
+      name: Length (inches)
+      description: Used for continuous tape when the cartridge has no die-cut height.
+      selector:
+        number:
+          min: 1
+          max: 36
+          step: 0.1
+          unit_of_measurement: in
+
+print_image:
+  name: Print image
+  description: Print a PNG/JPEG file or a camera snapshot on the M211.
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: brady_m211
+    filename:
+      name: File path
+      description: Path relative to the Home Assistant config directory.
+      selector:
+        text:
+    camera_entity_id:
+      name: Camera
+      selector:
+        entity:
+          domain: camera
+    copies:
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 99
+    length_in:
+      name: Length (inches)
+      selector:
+        number:
+          min: 1
+          max: 36
+          step: 0.1
+          unit_of_measurement: in

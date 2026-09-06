@@ -1,0 +1,66 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Brady M211",
+        "description": "Select an M211 discovered by Home Assistant Bluetooth (local adapter or ESPHome Bluetooth proxy).",
+        "data": {
+          "address": "Printer"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Brady M211",
+        "description": "Do you want to set up {name}?"
+      }
+    },
+    "abort": {
+      "already_configured": "This printer is already configured.",
+      "no_devices_found": "No M211 printers were found. Power the printer on and confirm an ESPHome Bluetooth proxy with active connections enabled can see it.",
+      "not_supported": "This Brady printer is not an M211."
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the printer.",
+      "owned": "The printer is owned by another device. Hold the M211 power button for 5 seconds until the Bluetooth LED pulses, then try again."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "M211 connection",
+        "description": "Keep connected uses a Bluetooth proxy slot the whole time. Leave it off unless you need live battery updates.",
+        "data": {
+          "keep_connected": "Stay connected",
+          "release_on_disconnect": "Release printer ownership when disconnecting (lets the phone app reconnect)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "battery": { "name": "Battery" },
+      "media_remaining": { "name": "Media remaining" },
+      "firmware": { "name": "Firmware" },
+      "printable_width": { "name": "Printable width" },
+      "printable_height": { "name": "Printable height" },
+      "job_status": { "name": "Last job" },
+      "cartridge_id": { "name": "Cartridge id" }
+    },
+    "binary_sensor": {
+      "connected": { "name": "Connected" },
+      "media_out": { "name": "Media out" },
+      "fatal_error": { "name": "Fatal error" },
+      "cut_error": { "name": "Cutter error" },
+      "print_job_error": { "name": "Print job error" },
+      "ac_power": { "name": "Charging" },
+      "die_cut": { "name": "Die-cut media" }
+    },
+    "button": {
+      "feed": { "name": "Feed" },
+      "cut": { "name": "Cut" },
+      "refresh": { "name": "Refresh" }
+    },
+    "notify": {
+      "label": { "name": "Print label" }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "entity": {
+    "button": {
+      "feed": { "default": "mdi:arrow-expand-down" },
+      "cut": { "default": "mdi:content-cut" },
+      "refresh": { "default": "mdi:refresh" }
+    },
+    "notify": {
+      "label": { "default": "mdi:printer-pos" }
+    }
+  }
+}
