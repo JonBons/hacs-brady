@@ -19,7 +19,6 @@ from bleak_retry_connector import BleakClientWithServiceCache, establish_connect
 
 from .const import (
     APOLLO_SERVICE_UUID,
-    CCCD_UUID,
     CHAR_PICL_REQUEST,
     CHAR_PICL_RESPONSE,
     CHAR_PRINT_JOB,
@@ -260,7 +259,8 @@ class BradyM211Client:
             except Exception:
                 _LOGGER.debug("Could not dump GATT map", exc_info=True)
             try:
-                # Android: CCCD indicate → RequestMtu(517) → session → compact subscribe.
+                # Android: CCCD indicate → MTU → session → compact subscribe.
+                # Bleak 3+ forbids writing CCCD 0x2902; start_notify arms indicate/notify.
                 await self._start_picl_indicate(client, required=True)
                 await self._try_request_mtu(client)
                 guid, first_claim = self._resolve_guid(ownership_id)
@@ -620,39 +620,12 @@ class BradyM211Client:
             return False
         log_verbose(
             _LOGGER,
-            "start_notify %s props=%s",
+            "start_notify %s props=%s (Bleak writes CCCD; direct 0x2902 writes are forbidden)",
             char_label(CHAR_PICL_RESPONSE),
             list(characteristic.properties or ()),
         )
         await client.start_notify(characteristic, self._on_picl)
-        await self._enable_picl_cccd(client, characteristic)
         return True
-
-    async def _enable_picl_cccd(self, client: BleakClient, characteristic: Any) -> None:
-        """Android uses CCCD 0x0002 (indicate). Also try notify if indicate is rejected."""
-        descriptor = None
-        for item in getattr(characteristic, "descriptors", ()) or ():
-            if str(item.uuid).lower().startswith("00002902"):
-                descriptor = item
-                break
-        if descriptor is None:
-            _LOGGER.warning(
-                "PICL response has no CCCD %s; relying on start_notify only",
-                CCCD_UUID,
-            )
-            return
-        for label, payload in (("indicate", b"\x02\x00"), ("notify", b"\x01\x00")):
-            try:
-                await client.write_gatt_descriptor(descriptor, payload)
-                log_verbose(
-                    _LOGGER,
-                    "Wrote PICL CCCD %s %s",
-                    label,
-                    payload.hex(),
-                )
-                return
-            except BleakError as err:
-                _LOGGER.warning("PICL CCCD %s write failed: %s", label, err)
 
     async def _rediscover_services(self, client: BleakClient) -> None:
         getter = getattr(client, "get_services", None)
