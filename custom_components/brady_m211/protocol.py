@@ -68,9 +68,12 @@ def chunk_payload_size(mtu_size: int) -> int:
     Bleak's ``mtu_size`` is the negotiated ATT MTU. The attribute value may be
     at most ``mtu_size - 3``. Subtract the Apollo chunk header as well.
     Floor at 16 so a 23-byte default MTU (typical for some proxies) still works.
+    Cap at 148 to match the Web SDK and live M211 indications (~153-byte ATT
+    payloads / ~156-byte MTU on BlueZ).
     """
     att_value = max(mtu_size - ATT_HEADER_BYTES, 20)
-    return max(att_value - CHUNK_HEADER_BYTES, 16)
+    usable = max(att_value - CHUNK_HEADER_BYTES, 16)
+    return min(usable, 148)
 
 
 def iter_chunks(
@@ -189,3 +192,53 @@ def _rebuild_get_responses(text: str) -> dict[str, object] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+class PiclAssembler:
+    """Reassemble Compact PICL indications that BlueZ splits at the ATT MTU."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def reset(self) -> None:
+        self._buf.clear()
+
+    @property
+    def buffered(self) -> int:
+        return len(self._buf)
+
+    def feed(self, data: bytes) -> list[bytes]:
+        """Return complete Compact PICL envelopes (GUID + length + JSON)."""
+        if not data:
+            return []
+        self._buf.extend(data)
+        complete: list[bytes] = []
+        while True:
+            packet = self._next_packet()
+            if packet is None:
+                break
+            complete.append(packet)
+        return complete
+
+    def _next_packet(self) -> bytes | None:
+        if len(self._buf) < 20:
+            return None
+        if bytes(self._buf[:16]) != COMPACT_PICL_GUID:
+            idx = bytes(self._buf).find(COMPACT_PICL_GUID)
+            if idx == -1:
+                if len(self._buf) > 15:
+                    del self._buf[:-15]
+                return None
+            del self._buf[:idx]
+            if len(self._buf) < 20:
+                return None
+        length = int.from_bytes(self._buf[16:20], "little")
+        if length > 65535:
+            self._buf.clear()
+            return None
+        total = 20 + length
+        if len(self._buf) < total:
+            return None
+        packet = bytes(self._buf[:total])
+        del self._buf[:total]
+        return packet

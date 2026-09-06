@@ -12,6 +12,8 @@ from brady_m211.const import (
 )
 from brady_m211.models import PrinterStatus
 from brady_m211.protocol import (
+    PiclAssembler,
+    build_picl_packet,
     build_session_payload,
     build_set_packet,
     build_subscribe_packet,
@@ -66,8 +68,9 @@ def test_chunking_last_and_flush() -> None:
 
 
 def test_chunk_payload_size_default_mtu() -> None:
-    assert chunk_payload_size(23) == 17 or chunk_payload_size(23) >= 16
-    assert chunk_payload_size(517) == 511
+    assert chunk_payload_size(23) >= 16
+    assert chunk_payload_size(156) == 148
+    assert chunk_payload_size(517) == 148
 
 
 def test_picl_subscribe_and_set_packets() -> None:
@@ -93,6 +96,33 @@ def test_parse_picl_with_envelope_and_prefix() -> None:
     noisy = b"xx" + inner
     parsed_noisy = parse_picl_notification(noisy)
     assert parsed_noisy[0][0] == "000C"
+
+
+def test_picl_assembler_reassembles_mtu_fragments() -> None:
+    inner = json.dumps(
+        {
+            "PropertyGetResponses": [
+                {"ID": f"{i:04X}", "Value": "False", "Status": "Successful"}
+                for i in range(1, 25)
+            ]
+        },
+        separators=(",", ":"),
+    )
+    packet = build_picl_packet(inner)
+    assert len(packet) > 153
+    assembler = PiclAssembler()
+    fragments = [packet[i : i + 153] for i in range(0, len(packet), 153)]
+    parsed: list[tuple[str, str, str]] = []
+    for index, fragment in enumerate(fragments):
+        complete = assembler.feed(fragment)
+        if index < len(fragments) - 1:
+            assert complete == []
+        else:
+            assert len(complete) == 1
+            parsed = parse_picl_notification(complete[0])
+    assert len(parsed) == 24
+    assert parsed[0][0] == "0001"
+    assert assembler.buffered == 0
 
 
 def test_status_from_properties() -> None:

@@ -22,6 +22,8 @@ from .const import (
     CHAR_PICL_RESPONSE,
     CHAR_PRINT_JOB,
     CHAR_SESSION_ID,
+    CHUNK_FLAG_FLUSH,
+    CHUNK_FLAG_MORE,
     PROP_CUT,
     PROP_FEED,
 )
@@ -37,6 +39,7 @@ from .models import PrinterStatus
 from .protocol import (
     BradyOwnershipError,
     BradyProtocolError,
+    PiclAssembler,
     build_session_payload,
     build_set_packet,
     build_subscribe_packet,
@@ -49,33 +52,68 @@ from .protocol import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_STATUS_WAIT_S = 8.0
+_STATUS_WAIT_S = 12.0
 _PRINT_WAIT_S = 90.0
-_FLUSH_PAUSE_S = 0.01
+_CHUNK_PAUSE_S = 0.01
+_GATT_RETRY_S = 0.1
+_GATT_RETRY_COUNT = 8
+_SESSION_SETTLE_S = 0.05
+
+
+def _error_text(err: BaseException) -> str:
+    return str(err).lower()
 
 
 def _is_write_not_permitted(err: BaseException) -> bool:
     """BlueZ returns ATT 0x03 when the write type does not match the characteristic."""
-    text = str(err).lower()
+    text = _error_text(err)
     return "write_not_permitted" in text or "write not permitted" in text
 
 
+def _is_insufficient_resource(err: BaseException) -> bool:
+    """ATT 0x11: printer buffer full. Android retries; continuation writes should be WWR."""
+    text = _error_text(err)
+    return "insufficient_resource" in text or "insufficient resource" in text
+
+
+def _is_ownership_failure(err: BaseException) -> bool:
+    text = _error_text(err)
+    return (
+        "insufficient authorization" in text
+        or "not authorized" in text
+        or "gatt status 19" in text
+    )
+
+
 def _char_properties(client: BleakClient, char_uuid: str) -> list[str]:
-    services = getattr(client, "services", None)
-    if not services:
-        return []
-    characteristic = services.get_characteristic(char_uuid)
+    characteristic = _find_characteristic(client, char_uuid)
     if characteristic is None:
         return []
     return list(characteristic.properties or ())
 
 
+def _find_characteristic(client: BleakClient, char_uuid: str) -> Any:
+    services = getattr(client, "services", None)
+    if not services:
+        return None
+    characteristic = services.get_characteristic(char_uuid)
+    if characteristic is not None:
+        return characteristic
+    wanted = char_uuid.lower()
+    for service in services:
+        for item in service.characteristics:
+            if str(item.uuid).lower() == wanted:
+                return item
+    return None
+
+
 def _preferred_write_response(client: BleakClient, char_uuid: str, default: bool = True) -> bool:
     props = _char_properties(client, char_uuid)
-    if "write" in props:
-        return True
+    # Live M211 on BlueZ rejects write-with-response even when "write" is advertised.
     if "write-without-response" in props:
         return False
+    if "write" in props:
+        return True
     return default
 
 
@@ -119,11 +157,11 @@ async def _write_char(
         await client.write_gatt_char(char_uuid, data, response=preferred)
         return
     except BleakError as err:
-        if not _is_write_not_permitted(err):
+        if not (_is_write_not_permitted(err) or (_is_insufficient_resource(err) and preferred)):
             raise
         other = not preferred
         _LOGGER.warning(
-            "GATT write %s response=%s not permitted (%s); retrying response=%s props=%s",
+            "GATT write %s response=%s failed (%s); retrying response=%s props=%s",
             char_label(char_uuid),
             preferred,
             err,
@@ -131,6 +169,35 @@ async def _write_char(
             _char_properties(client, char_uuid),
         )
         await client.write_gatt_char(char_uuid, data, response=other)
+
+
+async def _write_char_retry(
+    client: BleakClient,
+    char_uuid: str,
+    data: bytes,
+    *,
+    response: bool | None = None,
+) -> None:
+    """Retry ATT 0x11 (Insufficient Resource) with a short delay, as the Android app does."""
+    last_error: BleakError | None = None
+    for attempt in range(1, _GATT_RETRY_COUNT + 1):
+        try:
+            await _write_char(client, char_uuid, data, response=response)
+            return
+        except BleakError as err:
+            last_error = err
+            if not _is_insufficient_resource(err):
+                raise
+            _LOGGER.warning(
+                "GATT insufficient resource on %s attempt %s/%s; waiting %ss",
+                char_label(char_uuid),
+                attempt,
+                _GATT_RETRY_COUNT,
+                _GATT_RETRY_S,
+            )
+            await asyncio.sleep(_GATT_RETRY_S)
+    assert last_error is not None
+    raise last_error
 
 
 class BradyM211Client:
@@ -146,6 +213,7 @@ class BradyM211Client:
         self._disconnected.set()
         self.ownership_id: str | None = None
         self._released = True
+        self._picl = PiclAssembler()
 
     @property
     def is_connected(self) -> bool:
@@ -184,6 +252,7 @@ class BradyM211Client:
                 describe_ble_device(ble_device),
             )
             self._disconnected.clear()
+            self._picl.reset()
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 ble_device,
@@ -204,33 +273,30 @@ class BradyM211Client:
             except Exception:
                 _LOGGER.debug("Could not dump GATT map", exc_info=True)
             try:
-                log_verbose(
-                    _LOGGER,
-                    "start_notify %s (PICL indications)",
-                    char_label(CHAR_PICL_RESPONSE),
-                )
-                await client.start_notify(CHAR_PICL_RESPONSE, self._on_picl)
+                notify_ok = await self._start_picl_indicate(client, required=False)
                 guid, first_claim = self._resolve_guid(ownership_id)
                 await self._claim_session(client, guid, first_claim)
+                await asyncio.sleep(_SESSION_SETTLE_S)
+                if not notify_ok:
+                    await self._start_picl_indicate(client, required=True)
                 log_verbose(
                     _LOGGER,
-                    "Session claimed ownership_id=%s; sending PICL subscribe",
+                    "Session claimed ownership_id=%s",
                     self.ownership_id,
                 )
-                await self._write_chunked(CHAR_PICL_REQUEST, build_subscribe_packet())
             except BleakError as err:
-                _LOGGER.exception(
-                    "Failed to claim M211 GATT session (%s). Session writes that "
-                    "return Write Not Permitted are often the wrong GATT write "
-                    "type; ownership conflicts are usually Android status 19.",
-                    err,
-                )
+                _LOGGER.exception("Failed to claim M211 GATT session (%s)", err)
                 await self._disconnect_unlocked(release=False)
-                raise BradyOwnershipError(
-                    "Could not claim the M211. Close the Brady phone app, and if "
-                    "the Bluetooth LED is solid, hold power for 5 seconds until it "
-                    f"pulses, then reload this integration. ({err})"
-                ) from err
+                if _is_ownership_failure(err):
+                    raise BradyOwnershipError(
+                        "Could not claim the M211. Close the Brady phone app, and if "
+                        "the Bluetooth LED is solid, hold power for 5 seconds until it "
+                        f"pulses, then reload this integration. ({err})"
+                    ) from err
+                raise BradyProtocolError(f"M211 GATT error during connect: {err}") from err
+            except BradyProtocolError:
+                await self._disconnect_unlocked(release=False)
+                raise
             except Exception:
                 _LOGGER.exception("Unexpected error while connecting to M211")
                 await self._disconnect_unlocked(release=False)
@@ -251,6 +317,12 @@ class BradyM211Client:
             async with asyncio.timeout(timeout):
                 await self._status_event.wait()
         except TimeoutError:
+            if self._picl.buffered:
+                _LOGGER.warning(
+                    "Timed out with %s PICL bytes still buffered; discarding",
+                    self._picl.buffered,
+                )
+                self._picl.reset()
             _LOGGER.warning(
                 "Timed out waiting for PICL status after %ss; using cached values %s",
                 timeout,
@@ -367,6 +439,54 @@ class BradyM211Client:
         assert last_error is not None
         raise last_error
 
+    async def _start_picl_indicate(self, client: BleakClient, *, required: bool) -> bool:
+        """Subscribe to PICL indications, rediscovering GATT if BlueZ cache is incomplete."""
+        characteristic = _find_characteristic(client, CHAR_PICL_RESPONSE)
+        if characteristic is None:
+            await self._rediscover_services(client)
+            characteristic = _find_characteristic(client, CHAR_PICL_RESPONSE)
+        if characteristic is None:
+            message = (
+                "PICL response characteristic %s not in GATT map: %s"
+                % (
+                    CHAR_PICL_RESPONSE,
+                    [
+                        str(item.uuid)
+                        for service in (client.services or [])
+                        for item in service.characteristics
+                    ],
+                )
+            )
+            if required:
+                raise BradyProtocolError(message)
+            _LOGGER.warning("%s; will retry after session claim", message)
+            return False
+        log_verbose(
+            _LOGGER,
+            "start_notify %s props=%s",
+            char_label(CHAR_PICL_RESPONSE),
+            list(characteristic.properties or ()),
+        )
+        await client.start_notify(characteristic, self._on_picl)
+        return True
+
+    async def _rediscover_services(self, client: BleakClient) -> None:
+        clear = getattr(client, "clear_cache", None)
+        if callable(clear):
+            result = clear()
+            if asyncio.iscoroutine(result):
+                await result
+        getter = getattr(client, "get_services", None)
+        if callable(getter):
+            try:
+                await getter(dangerous_use_bleak_cache=False)
+            except TypeError:
+                await getter()
+        try:
+            self._log_gatt_map(client)
+        except Exception:
+            _LOGGER.debug("Could not dump GATT map after rediscovery", exc_info=True)
+
     def _ensure_connected(self) -> None:
         if not self.is_connected or self._client is None:
             raise BradyProtocolError("M211 is not connected")
@@ -432,9 +552,17 @@ class BradyM211Client:
                 log_verbose(_LOGGER, message, *args)
             else:
                 _LOGGER.debug(message, *args)
+            if flag == CHUNK_FLAG_MORE:
+                write_response = False
+            elif flag == CHUNK_FLAG_FLUSH:
+                write_response = True
+            else:
+                write_response = True
             try:
-                await _write_char(self._client, char_uuid, chunk)
-            except BleakError:
+                await _write_char_retry(
+                    self._client, char_uuid, chunk, response=write_response
+                )
+            except BleakError as err:
                 _LOGGER.exception(
                     "GATT write failed on %s chunk %s/%s flag=%s seq=%s",
                     char_label(char_uuid),
@@ -443,9 +571,10 @@ class BradyM211Client:
                     flag_label(flag),
                     seq,
                 )
-                raise
-            if flag == 2:
-                await asyncio.sleep(_FLUSH_PAUSE_S)
+                raise BradyProtocolError(
+                    f"GATT write failed on {char_label(char_uuid)}: {err}"
+                ) from err
+            await asyncio.sleep(_CHUNK_PAUSE_S)
         if not noisy_chunks:
             log_verbose(
                 _LOGGER,
@@ -456,28 +585,38 @@ class BradyM211Client:
 
     def _on_picl(self, _char: Any, data: bytearray) -> None:
         raw = bytes(data)
-        json_text = extract_picl_json(raw)
-        updates = parse_picl_notification(raw)
-        if not updates:
-            _LOGGER.warning(
-                "PICL indication had no PropertyGetResponses raw=%s json=%r",
-                format_bytes(raw, limit=96),
-                json_text,
+        packets = self._picl.feed(raw)
+        if not packets:
+            _LOGGER.debug(
+                "PICL fragment %s buffered=%s",
+                format_bytes(raw, limit=48),
+                self._picl.buffered,
             )
             return
-        for prop_id, value, _status in updates:
-            self._properties[prop_id] = value
-        log_verbose(
-            _LOGGER,
-            "PICL indication %s json=%s",
-            format_picl_updates(updates),
-            json_text or "<binary envelope only>",
-        )
-        self._status_event.set()
-        self._job_event.set()
+        for packet in packets:
+            json_text = extract_picl_json(packet)
+            updates = parse_picl_notification(packet)
+            if not updates:
+                _LOGGER.warning(
+                    "PICL packet had no PropertyGetResponses raw=%s json=%r",
+                    format_bytes(packet, limit=96),
+                    json_text,
+                )
+                continue
+            for prop_id, value, _status in updates:
+                self._properties[prop_id] = value
+            log_verbose(
+                _LOGGER,
+                "PICL indication %s json=%s",
+                format_picl_updates(updates),
+                json_text or "<binary envelope only>",
+            )
+            self._status_event.set()
+            self._job_event.set()
 
     def _on_disconnect(self, _client: BleakClient) -> None:
         log_verbose(_LOGGER, "M211 BLE disconnect callback fired")
+        self._picl.reset()
         self._disconnected.set()
 
     async def _disconnect_unlocked(self, *, release: bool) -> None:
