@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import BradyM211ConfigEntry, BradyM211Coordinator
 from .entity import BradyM211Entity
+from .logutil import log_verbose
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -57,4 +61,5 @@ class M211Button(BradyM211Entity, ButtonEntity):
         super().__init__(coordinator, description.key)
 
     async def async_press(self) -> None:
+        log_verbose(_LOGGER, "Button pressed: %s", self.entity_description.key)
         await self.entity_description.press_fn(self.coordinator)

@@ -10,6 +10,10 @@ DOMAIN: Final = "brady_m211"
 MANUFACTURER: Final = "Brady"
 MODEL: Final = "M211"
 
+# Bring-up: log connect / GATT / PICL / print milestones at info so they show
+# up without changing logger config. Set False once the printer is reliable.
+VERBOSE_LOGGING: Final = True
+
 CONF_OWNERSHIP_ID: Final = "ownership_id"
 CONF_KEEP_CONNECTED: Final = "keep_connected"
 CONF_RELEASE_ON_DISCONNECT: Final = "release_on_disconnect"
@@ -73,6 +77,35 @@ PROP_SHUTDOWN_TIMEOUT: Final = "0026"
 PROP_DISMISSIBLE_ERROR: Final = "0027"
 PROP_JOB_STATUS: Final = "0029"
 PROP_UNIQUE_ID: Final = "002A"
+
+PICL_PROP_NAMES: Final = {
+    PROP_BATTERY: "battery",
+    PROP_CUT: "cut",
+    PROP_CUT_ERROR: "cut_error",
+    PROP_FATAL_ERROR: "fatal_error",
+    PROP_FEED: "feed",
+    PROP_PRINT_JOB_ERROR: "print_job_error",
+    PROP_MEDIA_INVALID: "media_invalid",
+    PROP_PRINTABLE_WIDTH: "printable_width",
+    PROP_LEFT_OFFSET: "left_offset",
+    PROP_PRINTABLE_HEIGHT: "printable_height",
+    PROP_VERTICAL_OFFSET: "vertical_offset",
+    PROP_BLACK_STRIPED: "black_striped",
+    PROP_DIE_CUT: "die_cut",
+    PROP_PERMASLEEVE: "permasleeve",
+    PROP_SELF_LAM: "self_lam",
+    PROP_MEDIA_REMAINING: "media_remaining",
+    PROP_MEDIA_LOW: "media_low",
+    PROP_JOB_COMPLETE: "job_complete",
+    PROP_FIRMWARE: "firmware",
+    PROP_LOW_POWER: "low_power",
+    PROP_AC_CONNECTED: "ac_connected",
+    PROP_MEDIA_OUT: "media_out",
+    PROP_SHUTDOWN_TIMEOUT: "shutdown_timeout",
+    PROP_DISMISSIBLE_ERROR: "dismissible_error",
+    PROP_JOB_STATUS: "job_status",
+    PROP_UNIQUE_ID: "unique_id",
+}
 
 M211_SUBSCRIBE_IDS: Final = (
     PROP_FATAL_ERROR,

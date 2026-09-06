@@ -127,6 +127,11 @@ def build_set_packet(property_id: str, value: str) -> bytes:
     return build_picl_packet(json.dumps(body, separators=(",", ":")))
 
 
+def extract_picl_json(data: bytes) -> str:
+    """Return the UTF-8 JSON body from a Compact PICL envelope, if any."""
+    return _extract_json_text(data)
+
+
 def parse_picl_notification(data: bytes) -> list[tuple[str, str, str]]:
     """Parse one or more Compact PICL indication payloads into (id, value, status)."""
     text = _extract_json_text(data)

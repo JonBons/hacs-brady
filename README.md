@@ -68,6 +68,27 @@ data:
 - Output is 203 dpi monochrome only. The printer never receives fonts or `.BWS` files.
 - Do not pair the printer in the phone/OS Bluetooth settings. Only this integration or the Brady app should own the GATT session.
 
+## Debugging
+
+Bring-up logging is currently **on**. Connection, GATT session, PICL JSON, and print milestones log at **info**, so they show up in Home Assistant without changing logger config. Filter Developer tools → Logs for `brady_m211`.
+
+To also see Bleak / Bluetooth proxy internals:
+
+```yaml
+logger:
+  default: info
+  logs:
+    custom_components.brady_m211: debug
+    bleak: debug
+    bleak_retry_connector: debug
+    habluetooth: debug
+    homeassistant.components.bluetooth: debug
+```
+
+Or set those levels at runtime with Developer tools → Actions → `logger.set_level`. Advertisements and individual print-job GATT chunks stay at **debug** so a long label does not flood the log.
+
+Set `VERBOSE_LOGGING = False` in `custom_components/brady_m211/const.py` once the printer is printing reliably.
+
 ## HACS publishing notes
 
 Repository: [JonBons/hacs-brady](https://github.com/JonBons/hacs-brady)

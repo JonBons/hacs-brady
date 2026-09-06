@@ -25,6 +25,7 @@ from .const import (
     DOMAIN,
     LOCAL_NAME_PREFIX,
 )
+from .logutil import describe_ble_device, describe_service_info, log_verbose
 from .protocol import BradyOwnershipError, is_m211_name
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,7 +54,17 @@ class BradyM211ConfigFlow(ConfigFlow, domain=DOMAIN):
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> ConfigFlowResult:
         if not is_m211_name(discovery_info.name):
+            _LOGGER.debug(
+                "Ignoring Bluetooth discovery (not an M211): %s",
+                describe_service_info(discovery_info),
+            )
             return self.async_abort(reason="not_supported")
+        log_verbose(
+            _LOGGER,
+            "Bluetooth discovery: %s device=%s",
+            describe_service_info(discovery_info),
+            describe_ble_device(discovery_info.device),
+        )
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
         self._discovery_info = discovery_info
@@ -83,6 +94,10 @@ class BradyM211ConfigFlow(ConfigFlow, domain=DOMAIN):
             try:
                 return await self._async_create_from_discovery(info)
             except BradyOwnershipError:
+                _LOGGER.warning(
+                    "Config flow could not claim %s",
+                    describe_service_info(info),
+                )
                 errors["base"] = "owned"
             except Exception:
                 _LOGGER.exception("Unexpected error connecting to M211")
@@ -117,9 +132,25 @@ class BradyM211ConfigFlow(ConfigFlow, domain=DOMAIN):
         self, info: BluetoothServiceInfoBleak
     ) -> ConfigFlowResult:
         client = BradyM211Client()
+        log_verbose(
+            _LOGGER,
+            "Config flow connecting to confirm printer: %s device=%s",
+            describe_service_info(info),
+            describe_ble_device(info.device),
+        )
         try:
             ownership_id = await client.connect(info.device, name=info.name or "M211")
-            await client.refresh_status()
+            status = await client.refresh_status()
+            log_verbose(
+                _LOGGER,
+                "Config flow connected ownership_id=%s battery=%r firmware=%r "
+                "printable=%sx%s",
+                ownership_id,
+                status.battery,
+                status.firmware,
+                status.printable_width,
+                status.printable_height,
+            )
         finally:
             await client.disconnect(release=True)
         return self.async_create_entry(

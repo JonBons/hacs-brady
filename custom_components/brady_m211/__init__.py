@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 from pathlib import Path
 
 import voluptuous as vol
 
-from homeassistant.const import CONF_DEVICE_ID, Platform
+from homeassistant.const import CONF_ADDRESS, CONF_DEVICE_ID, Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 
-from .const import DOMAIN
+from .const import DOMAIN, VERBOSE_LOGGING
 from .coordinator import BradyM211ConfigEntry, BradyM211Coordinator
+from .logutil import log_verbose
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
@@ -60,6 +64,14 @@ def _register_services(hass: HomeAssistant) -> None:
 
     async def _print_text(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(call.data[CONF_DEVICE_ID])
+        log_verbose(
+            _LOGGER,
+            "Service print_text device_id=%s copies=%s length_in=%s message=%r",
+            call.data[CONF_DEVICE_ID],
+            call.data["copies"],
+            call.data.get("length_in"),
+            call.data["message"],
+        )
         await coordinator.async_print_text(
             call.data["message"],
             copies=call.data["copies"],
@@ -68,6 +80,15 @@ def _register_services(hass: HomeAssistant) -> None:
 
     async def _print_image(call: ServiceCall) -> None:
         coordinator = _coordinator_for_device(call.data[CONF_DEVICE_ID])
+        log_verbose(
+            _LOGGER,
+            "Service print_image device_id=%s copies=%s length_in=%s filename=%s camera=%s",
+            call.data[CONF_DEVICE_ID],
+            call.data["copies"],
+            call.data.get("length_in"),
+            call.data.get("filename"),
+            call.data.get("camera_entity_id"),
+        )
         image: bytes
         if not call.data.get("filename") and not call.data.get("camera_entity_id"):
             raise ServiceValidationError("Provide filename or camera_entity_id")
@@ -99,6 +120,15 @@ def _register_services(hass: HomeAssistant) -> None:
 
 async def async_setup_entry(hass: HomeAssistant, entry: BradyM211ConfigEntry) -> bool:
     """Set up one M211 from a config entry."""
+    log_verbose(
+        _LOGGER,
+        "Setting up entry_id=%s title=%s address=%s verbose_logging=%s options=%s",
+        entry.entry_id,
+        entry.title,
+        entry.data.get(CONF_ADDRESS),
+        VERBOSE_LOGGING,
+        dict(entry.options),
+    )
     if not hass.services.has_service(DOMAIN, SERVICE_PRINT_TEXT):
         _register_services(hass)
     coordinator = BradyM211Coordinator(hass, entry)
@@ -115,6 +145,7 @@ async def _async_reload(hass: HomeAssistant, entry: BradyM211ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: BradyM211ConfigEntry) -> bool:
+    log_verbose(_LOGGER, "Unloading entry_id=%s title=%s", entry.entry_id, entry.title)
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         await entry.runtime_data.async_shutdown_client()

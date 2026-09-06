@@ -30,7 +30,9 @@ from .const import (
     KEEP_CONNECTED_SCAN_INTERVAL,
     MANUFACTURER,
     MODEL,
+    VERBOSE_LOGGING,
 )
+from .logutil import describe_ble_device, describe_service_info, log_verbose
 from .models import PrinterStatus
 from .protocol import BradyOwnershipError, BradyProtocolError
 from .render import render_image_bytes, render_text
@@ -68,6 +70,17 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
             name=entry.title or MODEL,
             update_interval=interval,
         )
+        log_verbose(
+            _LOGGER,
+            "Coordinator init address=%s keep_connected=%s release_on_disconnect=%s "
+            "interval=%s verbose_logging=%s ownership_id=%s",
+            self.address,
+            self.keep_connected,
+            self.release_on_disconnect,
+            interval,
+            VERBOSE_LOGGING,
+            entry.data.get(CONF_OWNERSHIP_ID),
+        )
         self.client = BradyM211Client()
         self.client.ownership_id = entry.data.get(CONF_OWNERSHIP_ID)
         self._ble_device: BLEDevice | None = None
@@ -91,16 +104,32 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
             self.hass, self.address, True
         )
         if self._ble_device is None:
+            _LOGGER.error(
+                "Could not resolve BLEDevice for %s (connectable=True). No adapter "
+                "or ESPHome proxy currently sees the printer.",
+                self.address,
+            )
             raise ConfigEntryNotReady(
                 f"Could not find {MODEL} {self.address}. Make sure an ESPHome "
                 "Bluetooth proxy has active: true, or a Bluetooth adapter can "
                 "reach the printer."
             )
+        log_verbose(
+            _LOGGER,
+            "Resolved BLEDevice at setup: %s",
+            describe_ble_device(self._ble_device),
+        )
 
         @callback
         def _async_update_ble(
-            service_info: BluetoothServiceInfoBleak, _change: BluetoothChange
+            service_info: BluetoothServiceInfoBleak, change: BluetoothChange
         ) -> None:
+            _LOGGER.debug(
+                "Advertisement update change=%s %s device=%s",
+                change,
+                describe_service_info(service_info),
+                describe_ble_device(service_info.device),
+            )
             self._ble_device = service_info.device
 
         self._unsub_bt = bluetooth.async_register_callback(
@@ -112,19 +141,42 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
         self.config_entry.async_on_unload(self._unsub_bt)
 
     async def async_shutdown_client(self) -> None:
+        log_verbose(_LOGGER, "Shutting down M211 client release=%s", self.release_on_disconnect)
         await self.client.disconnect(release=self.release_on_disconnect)
 
     async def _async_update_data(self) -> PrinterStatus:
+        log_verbose(
+            _LOGGER,
+            "Status poll starting keep_connected=%s connected=%s",
+            self.keep_connected,
+            self.client.is_connected,
+        )
         try:
             await self._ensure_connected()
             status = await self.client.refresh_status()
         except BradyOwnershipError as err:
+            _LOGGER.error("Status poll ownership failure: %s", err)
             raise UpdateFailed(str(err)) from err
         except (BradyProtocolError, OSError, TimeoutError) as err:
+            _LOGGER.exception("Status poll failed: %s", err)
             raise UpdateFailed(f"M211 communication failed: {err}") from err
         finally:
             if not self.keep_connected:
+                log_verbose(
+                    _LOGGER,
+                    "Status poll finished; disconnecting (connect-on-demand) release=%s",
+                    self.release_on_disconnect,
+                )
                 await self.client.disconnect(release=self.release_on_disconnect)
+        log_verbose(
+            _LOGGER,
+            "Status poll ok battery=%r firmware=%r printable=%sx%s media=%s",
+            status.battery,
+            status.firmware,
+            status.printable_width,
+            status.printable_height,
+            status.media_remaining,
+        )
         return status
 
     async def async_feed(self) -> None:
@@ -138,6 +190,15 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
     ) -> None:
         async def _print() -> None:
             status = await self.client.refresh_status()
+            log_verbose(
+                _LOGGER,
+                "Rendering text copies=%s length_in=%s printable=%sx%s message=%r",
+                copies,
+                length_in,
+                status.printable_width,
+                status.printable_height,
+                message,
+            )
             rows = render_text(
                 message,
                 printable_width=status.printable_width,
@@ -153,6 +214,15 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
     ) -> None:
         async def _print() -> None:
             status = await self.client.refresh_status()
+            log_verbose(
+                _LOGGER,
+                "Rendering image copies=%s length_in=%s printable=%sx%s bytes=%s",
+                copies,
+                length_in,
+                status.printable_width,
+                status.printable_height,
+                len(image),
+            )
             rows = render_image_bytes(
                 image,
                 printable_width=status.printable_width,
@@ -176,6 +246,18 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
         page_h = status.printable_height or height
         if page_h <= 0:
             page_h = height
+        log_verbose(
+            _LOGGER,
+            "Encoding VGL6 job=%s copies=%s raster=%sx%s page=%sx%s offsets=%s,%s",
+            job_name,
+            copies,
+            width,
+            height,
+            page_w,
+            page_h,
+            status.left_offset or 0,
+            status.vertical_offset or 0,
+        )
         payload = encode_vgl6_job(
             rows,
             page_width=page_w,
@@ -190,16 +272,29 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
         await self.client.print_job(payload, job_name=job_name)
 
     async def _run_command(self, func: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        log_verbose(
+            _LOGGER,
+            "Command starting keep_connected=%s connected=%s",
+            self.keep_connected,
+            self.client.is_connected,
+        )
         try:
             await self._ensure_connected()
             await func()
             self.async_set_updated_data(self.client.status)
         except BradyOwnershipError as err:
+            _LOGGER.error("Command ownership failure: %s", err)
             raise HomeAssistantError(str(err)) from err
         except BradyProtocolError as err:
+            _LOGGER.exception("Command protocol failure: %s", err)
             raise HomeAssistantError(str(err)) from err
         finally:
             if not self.keep_connected:
+                log_verbose(
+                    _LOGGER,
+                    "Command finished; disconnecting (connect-on-demand) release=%s",
+                    self.release_on_disconnect,
+                )
                 await self.client.disconnect(release=self.release_on_disconnect)
 
     async def _ensure_connected(self) -> None:
@@ -207,17 +302,27 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
             self.hass, self.address, True
         )
         if ble_device is None:
+            _LOGGER.error(
+                "M211 %s not reachable via any Bluetooth adapter or ESPHome proxy",
+                self.address,
+            )
             raise HomeAssistantError(
                 f"{MODEL} {self.address} is not currently reachable via any "
                 "Bluetooth adapter or ESPHome Bluetooth proxy"
             )
         self._ble_device = ble_device
+        log_verbose(
+            _LOGGER,
+            "Ensuring GATT session via %s",
+            describe_ble_device(ble_device),
+        )
         ownership = await self.client.connect(
             ble_device,
             ownership_id=self.config_entry.data.get(CONF_OWNERSHIP_ID),
             name=self.config_entry.title or MODEL,
         )
         if ownership and ownership != self.config_entry.data.get(CONF_OWNERSHIP_ID):
+            log_verbose(_LOGGER, "Persisting new ownership_id=%s", ownership)
             self.hass.config_entries.async_update_entry(
                 self.config_entry,
                 data={**self.config_entry.data, CONF_OWNERSHIP_ID: ownership},
