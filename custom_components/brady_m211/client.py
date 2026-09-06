@@ -18,12 +18,11 @@ from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 from .const import (
+    APOLLO_SERVICE_UUID,
     CHAR_PICL_REQUEST,
     CHAR_PICL_RESPONSE,
     CHAR_PRINT_JOB,
     CHAR_SESSION_ID,
-    CHUNK_FLAG_FLUSH,
-    CHUNK_FLAG_MORE,
     PROP_CUT,
     PROP_FEED,
 )
@@ -58,6 +57,8 @@ _CHUNK_PAUSE_S = 0.01
 _GATT_RETRY_S = 0.1
 _GATT_RETRY_COUNT = 8
 _SESSION_SETTLE_S = 0.05
+_APOLLO_WAIT_S = 6.0
+_APOLLO_POLL_S = 0.5
 
 
 def _error_text(err: BaseException) -> str:
@@ -85,6 +86,11 @@ def _is_ownership_failure(err: BaseException) -> bool:
     )
 
 
+def _is_disconnect_noise(err: BaseException) -> bool:
+    text = _error_text(err)
+    return "unlikely" in text or "not connected" in text or "disconnected" in text
+
+
 def _char_properties(client: BleakClient, char_uuid: str) -> list[str]:
     characteristic = _find_characteristic(client, char_uuid)
     if characteristic is None:
@@ -107,14 +113,23 @@ def _find_characteristic(client: BleakClient, char_uuid: str) -> Any:
     return None
 
 
-def _preferred_write_response(client: BleakClient, char_uuid: str, default: bool = True) -> bool:
-    props = _char_properties(client, char_uuid)
-    # Live M211 on BlueZ rejects write-with-response even when "write" is advertised.
-    if "write-without-response" in props:
-        return False
-    if "write" in props:
-        return True
-    return default
+def _listed_char_uuids(client: BleakClient) -> list[str]:
+    services = getattr(client, "services", None)
+    if not services:
+        return []
+    return [
+        str(item.uuid)
+        for service in services
+        for item in service.characteristics
+    ]
+
+
+def _has_apollo(client: BleakClient) -> bool:
+    return (
+        _find_characteristic(client, CHAR_SESSION_ID) is not None
+        and _find_characteristic(client, CHAR_PICL_RESPONSE) is not None
+        and _find_characteristic(client, CHAR_PICL_REQUEST) is not None
+    )
 
 
 def _resolved_mtu(client: BleakClient | None) -> int:
@@ -147,14 +162,11 @@ async def _write_char(
     *,
     response: bool | None = None,
 ) -> None:
-    """Write using the characteristic's supported type, then the other on ATT 0x03."""
-    preferred = (
-        _preferred_write_response(client, char_uuid)
-        if response is None
-        else response
-    )
+    """Write without response first; fall back if the stack rejects that type."""
+    preferred = False if response is None else response
+    characteristic = _find_characteristic(client, char_uuid) or char_uuid
     try:
-        await client.write_gatt_char(char_uuid, data, response=preferred)
+        await client.write_gatt_char(characteristic, data, response=preferred)
         return
     except BleakError as err:
         if not (_is_write_not_permitted(err) or (_is_insufficient_resource(err) and preferred)):
@@ -168,7 +180,7 @@ async def _write_char(
             other,
             _char_properties(client, char_uuid),
         )
-        await client.write_gatt_char(char_uuid, data, response=other)
+        await client.write_gatt_char(characteristic, data, response=other)
 
 
 async def _write_char_retry(
@@ -214,6 +226,7 @@ class BradyM211Client:
         self.ownership_id: str | None = None
         self._released = True
         self._picl = PiclAssembler()
+        self._picl_subscribed = False
 
     @property
     def is_connected(self) -> bool:
@@ -253,13 +266,8 @@ class BradyM211Client:
             )
             self._disconnected.clear()
             self._picl.reset()
-            client = await establish_connection(
-                BleakClientWithServiceCache,
-                ble_device,
-                ble_device.name or name,
-                disconnected_callback=self._on_disconnect,
-                max_attempts=5,
-            )
+            self._picl_subscribed = False
+            client = await self._establish_apollo(ble_device, name)
             self._client = client
             log_verbose(
                 _LOGGER,
@@ -311,8 +319,12 @@ class BradyM211Client:
         log_verbose(_LOGGER, "Refreshing PICL status (timeout=%ss)", timeout)
         async with self._lock:
             self._ensure_connected()
+            if self._picl_subscribed and self._properties:
+                return self.status
             self._status_event.clear()
-            await self._write_chunked(CHAR_PICL_REQUEST, build_subscribe_packet())
+            if not self._picl_subscribed:
+                await self._write_chunked(CHAR_PICL_REQUEST, build_subscribe_packet())
+                self._picl_subscribed = True
         try:
             async with asyncio.timeout(timeout):
                 await self._status_event.wait()
@@ -423,7 +435,7 @@ class BradyM211Client:
                 format_bytes(payload),
             )
             try:
-                await _write_char(client, CHAR_SESSION_ID, payload)
+                await _write_char(client, CHAR_SESSION_ID, payload, response=False)
                 self.ownership_id = str(guid)
                 self._released = False
                 return
@@ -438,6 +450,82 @@ class BradyM211Client:
                 )
         assert last_error is not None
         raise last_error
+
+    async def _establish_apollo(self, ble_device: BLEDevice, name: str) -> BleakClient:
+        """Connect and wait until Brady Apollo characteristics exist (not just GAP)."""
+        client = await self._establish_connection(ble_device, name, use_cache=False)
+        if await self._wait_for_apollo(client):
+            return client
+        _LOGGER.warning(
+            "Apollo service %s missing after connect; GATT was %s. "
+            "Clearing BlueZ/Bleak cache and reconnecting.",
+            APOLLO_SERVICE_UUID,
+            _listed_char_uuids(client),
+        )
+        try:
+            clear = getattr(client, "clear_cache", None)
+            if callable(clear):
+                result = clear()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            _LOGGER.debug("clear_cache failed", exc_info=True)
+        try:
+            await client.disconnect()
+        except BleakError:
+            _LOGGER.debug("Disconnect before cache-clear reconnect failed", exc_info=True)
+        client = await self._establish_connection(ble_device, name, use_cache=False)
+        if await self._wait_for_apollo(client):
+            return client
+        self._log_gatt_map(client)
+        raise BradyProtocolError(
+            "M211 Apollo GATT was not discovered (only "
+            f"{_listed_char_uuids(client)}). Power-cycle the printer and reload "
+            "the Bluetooth integration to drop a stale BlueZ cache."
+        )
+
+    async def _establish_connection(
+        self, ble_device: BLEDevice, name: str, *, use_cache: bool
+    ) -> BleakClient:
+        kwargs: dict[str, Any] = {
+            "disconnected_callback": self._on_disconnect,
+            "max_attempts": 5,
+            "use_services_cache": use_cache,
+        }
+        try:
+            return await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                ble_device.name or name,
+                **kwargs,
+            )
+        except TypeError:
+            kwargs.pop("use_services_cache", None)
+            return await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                ble_device.name or name,
+                **kwargs,
+            )
+
+    async def _wait_for_apollo(self, client: BleakClient) -> bool:
+        deadline = asyncio.get_running_loop().time() + _APOLLO_WAIT_S
+        while True:
+            if _has_apollo(client):
+                log_verbose(
+                    _LOGGER,
+                    "Apollo GATT ready: %s",
+                    _listed_char_uuids(client),
+                )
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            _LOGGER.debug(
+                "Waiting for Apollo GATT, currently %s",
+                _listed_char_uuids(client),
+            )
+            await self._rediscover_services(client)
+            await asyncio.sleep(_APOLLO_POLL_S)
 
     async def _start_picl_indicate(self, client: BleakClient, *, required: bool) -> bool:
         """Subscribe to PICL indications, rediscovering GATT if BlueZ cache is incomplete."""
@@ -471,21 +559,13 @@ class BradyM211Client:
         return True
 
     async def _rediscover_services(self, client: BleakClient) -> None:
-        clear = getattr(client, "clear_cache", None)
-        if callable(clear):
-            result = clear()
-            if asyncio.iscoroutine(result):
-                await result
         getter = getattr(client, "get_services", None)
-        if callable(getter):
-            try:
-                await getter(dangerous_use_bleak_cache=False)
-            except TypeError:
-                await getter()
+        if not callable(getter):
+            return
         try:
-            self._log_gatt_map(client)
-        except Exception:
-            _LOGGER.debug("Could not dump GATT map after rediscovery", exc_info=True)
+            await getter(dangerous_use_bleak_cache=False)
+        except TypeError:
+            await getter()
 
     def _ensure_connected(self) -> None:
         if not self.is_connected or self._client is None:
@@ -552,15 +632,9 @@ class BradyM211Client:
                 log_verbose(_LOGGER, message, *args)
             else:
                 _LOGGER.debug(message, *args)
-            if flag == CHUNK_FLAG_MORE:
-                write_response = False
-            elif flag == CHUNK_FLAG_FLUSH:
-                write_response = True
-            else:
-                write_response = True
             try:
                 await _write_char_retry(
-                    self._client, char_uuid, chunk, response=write_response
+                    self._client, char_uuid, chunk, response=False
                 )
             except BleakError as err:
                 _LOGGER.exception(
@@ -587,7 +661,8 @@ class BradyM211Client:
         raw = bytes(data)
         packets = self._picl.feed(raw)
         if not packets:
-            _LOGGER.debug(
+            log_verbose(
+                _LOGGER,
                 "PICL fragment %s buffered=%s",
                 format_bytes(raw, limit=48),
                 self._picl.buffered,
@@ -617,6 +692,7 @@ class BradyM211Client:
     def _on_disconnect(self, _client: BleakClient) -> None:
         log_verbose(_LOGGER, "M211 BLE disconnect callback fired")
         self._picl.reset()
+        self._picl_subscribed = False
         self._disconnected.set()
 
     async def _disconnect_unlocked(self, *, release: bool) -> None:
@@ -636,16 +712,22 @@ class BradyM211Client:
         try:
             if client.is_connected and release:
                 try:
-                    payload = release_session_payload()
-                    log_verbose(
-                        _LOGGER,
-                        "Writing session release %s",
-                        format_bytes(payload),
-                    )
-                    await _write_char(client, CHAR_SESSION_ID, payload)
-                    self._released = True
-                except BleakError:
-                    _LOGGER.warning("Failed to release M211 ownership", exc_info=True)
+                    if _find_characteristic(client, CHAR_SESSION_ID) is None:
+                        _LOGGER.debug("Skipping session release; characteristic not in GATT map")
+                    else:
+                        payload = release_session_payload()
+                        log_verbose(
+                            _LOGGER,
+                            "Writing session release %s",
+                            format_bytes(payload),
+                        )
+                        await _write_char(client, CHAR_SESSION_ID, payload, response=False)
+                        self._released = True
+                except BleakError as err:
+                    if _is_disconnect_noise(err):
+                        _LOGGER.debug("Session release failed during disconnect: %s", err)
+                    else:
+                        _LOGGER.warning("Failed to release M211 ownership", exc_info=True)
             elif not release:
                 self._released = False
                 log_verbose(_LOGGER, "Keeping ownership on disconnect (release=False)")
