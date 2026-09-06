@@ -246,6 +246,9 @@ class BradyM211Coordinator(DataUpdateCoordinator[PrinterStatus]):
         page_h = status.printable_height or height
         if page_h <= 0:
             page_h = height
+        blocked = status.print_blocked_reason()
+        if blocked:
+            raise HomeAssistantError(f"M211 cannot print: {blocked}")
         log_verbose(
             _LOGGER,
             "Encoding VGL6 job=%s copies=%s raster=%sx%s page=%sx%s offsets=%s,%s",

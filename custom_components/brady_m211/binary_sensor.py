@@ -68,6 +68,24 @@ BINARIES: tuple[M211BinaryDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s, _c: s.die_cut,
     ),
+    M211BinaryDescription(
+        key="media_invalid",
+        translation_key="media_invalid",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        value_fn=lambda s, _c: s.media_invalid,
+    ),
+    M211BinaryDescription(
+        key="media_low",
+        translation_key="media_low",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        value_fn=lambda s, _c: s.media_low,
+    ),
+    M211BinaryDescription(
+        key="low_power",
+        translation_key="low_power",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        value_fn=lambda s, _c: s.low_power,
+    ),
 )
 
 

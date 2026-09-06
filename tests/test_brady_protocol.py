@@ -9,19 +9,23 @@ from brady_m211.const import (
     COMPACT_PICL_GUID,
     PROP_CUT,
     PROP_FEED,
+    PROP_KNOCKOFF,
 )
 from brady_m211.models import PrinterStatus
 from brady_m211.protocol import (
     PiclAssembler,
+    build_get_packet,
     build_picl_packet,
     build_session_payload,
     build_set_packet,
     build_subscribe_packet,
     chunk_payload_size,
+    chunk_write_with_response,
     guid_to_dotnet_bytes,
     is_m211_name,
     iter_chunks,
     parse_picl_notification,
+    release_session_payload,
 )
 from brady_m211.vgl import (
     encode_rle_row,
@@ -52,6 +56,15 @@ def test_session_payload_claim_and_reuse() -> None:
     assert first[-1] == 0x01
     assert reuse[-1] == 0x00
     assert first[:-1] == reuse[:-1]
+    assert release_session_payload() == bytes(16)
+
+
+def test_chunk_write_with_response_matches_android() -> None:
+    assert chunk_write_with_response(CHUNK_FLAG_MORE, 0) is True
+    assert chunk_write_with_response(CHUNK_FLAG_MORE, 1) is False
+    assert chunk_write_with_response(CHUNK_FLAG_FLUSH, 5) is True
+    assert chunk_write_with_response(CHUNK_FLAG_LAST, 9) is True
+    assert chunk_write_with_response(CHUNK_FLAG_MORE, 2, retrying=True) is True
 
 
 def test_chunking_last_and_flush() -> None:
@@ -79,10 +92,21 @@ def test_picl_subscribe_and_set_packets() -> None:
     length = int.from_bytes(subscribe[16:20], "little")
     body = json.loads(subscribe[20 : 20 + length])
     assert "PropertySubscribeRequests" in body
+    ids = [item["ID"] for item in body["PropertySubscribeRequests"]]
+    assert PROP_KNOCKOFF in ids
+    assert ids[-1] == PROP_KNOCKOFF
     feed = build_set_packet(PROP_FEED, "True")
     cut = build_set_packet(PROP_CUT, "True")
     assert b"0007" in feed
     assert b"0004" in cut
+    feed_len = int.from_bytes(feed[16:20], "little")
+    feed_body = json.loads(feed[20 : 20 + feed_len])
+    assert feed_body["PropertySetRequests"][0]["Value"] == "True"
+    getter = build_get_packet()
+    assert getter.startswith(COMPACT_PICL_GUID)
+    get_len = int.from_bytes(getter[16:20], "little")
+    get_body = json.loads(getter[20 : 20 + get_len])
+    assert "PropertyGetRequests" in get_body
 
 
 def test_parse_picl_with_envelope_and_prefix() -> None:
@@ -133,6 +157,9 @@ def test_status_from_properties() -> None:
     assert status.fatal_error is False
     assert status.media_out is True
     assert status.has_error is True
+    assert status.print_blocked_reason() == "media is out"
+    empty_media = PrinterStatus.from_properties({"001C": "True"})
+    assert empty_media.print_blocked_reason() == "media remaining is empty"
 
 
 def test_rle_and_vgl_job_roundtrip_shape() -> None:

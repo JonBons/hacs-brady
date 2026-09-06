@@ -53,6 +53,7 @@ class PrinterStatus:
     job_complete: bool | None = None
     job_status: str | None = None
     shutdown_timeout: int | None = None
+    knockoff_count: int | None = None
 
     @classmethod
     def from_properties(cls, values: dict[str, str]) -> PrinterStatus:
@@ -67,6 +68,7 @@ class PrinterStatus:
             PROP_FIRMWARE,
             PROP_JOB_COMPLETE,
             PROP_JOB_STATUS,
+            PROP_KNOCKOFF,
             PROP_LEFT_OFFSET,
             PROP_LOW_POWER,
             PROP_MEDIA_INVALID,
@@ -108,23 +110,28 @@ class PrinterStatus:
             job_complete=_as_bool(values.get(PROP_JOB_COMPLETE)),
             job_status=values.get(PROP_JOB_STATUS),
             shutdown_timeout=_as_int(values.get(PROP_SHUTDOWN_TIMEOUT)),
+            knockoff_count=_as_int(values.get(PROP_KNOCKOFF)),
         )
 
     @property
     def has_error(self) -> bool:
         """Return True if the printer is reporting a blocking error."""
-        return any(
-            flag
-            for flag in (
-                self.fatal_error,
-                self.cut_error,
-                self.media_invalid,
-                self.media_out,
-                self.print_job_error,
-                self.low_power,
-            )
-            if flag
+        return self.print_blocked_reason() is not None or bool(self.print_job_error)
+
+    def print_blocked_reason(self) -> str | None:
+        """Android ThereAreShowStoppingPrinterErrors, in the same check order."""
+        checks = (
+            (self.media_low, "media remaining is empty"),
+            (self.media_out, "media is out"),
+            (self.media_invalid, "media is invalid"),
+            (self.cut_error, "cutter error"),
+            (self.low_power, "battery too low"),
+            (self.fatal_error, "fatal error"),
         )
+        for flag, reason in checks:
+            if flag:
+                return reason
+        return None
 
     def job_succeeded(self, job_name: str | None = None) -> bool | None:
         """Interpret PrintJobIdAndStatus (`id: Successful|Failed`)."""

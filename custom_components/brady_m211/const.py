@@ -77,6 +77,7 @@ PROP_SHUTDOWN_TIMEOUT: Final = "0026"
 PROP_DISMISSIBLE_ERROR: Final = "0027"
 PROP_JOB_STATUS: Final = "0029"
 PROP_UNIQUE_ID: Final = "002A"
+PROP_KNOCKOFF: Final = "009D"
 
 PICL_PROP_NAMES: Final = {
     PROP_BATTERY: "battery",
@@ -105,8 +106,10 @@ PICL_PROP_NAMES: Final = {
     PROP_DISMISSIBLE_ERROR: "dismissible_error",
     PROP_JOB_STATUS: "job_status",
     PROP_UNIQUE_ID: "unique_id",
+    PROP_KNOCKOFF: "knockoff_count",
 }
 
+# Order matches Express Labels PE.Ble SubscribeToTheDesiredPiclProperties.
 M211_SUBSCRIBE_IDS: Final = (
     PROP_FATAL_ERROR,
     PROP_CUT_ERROR,
@@ -132,4 +135,22 @@ M211_SUBSCRIBE_IDS: Final = (
     PROP_MEDIA_REMAINING,
     PROP_JOB_COMPLETE,
     PROP_FIRMWARE,
+    PROP_KNOCKOFF,
 )
+
+# Immediate PropertyGetRequests used to populate sensors; subscribe still covers the rest.
+M211_GET_IDS: Final = (
+    PROP_BATTERY,
+    PROP_FIRMWARE,
+    PROP_PRINTABLE_WIDTH,
+    PROP_PRINTABLE_HEIGHT,
+    PROP_MEDIA_REMAINING,
+    PROP_MEDIA_OUT,
+    PROP_FATAL_ERROR,
+    PROP_AC_CONNECTED,
+    PROP_UNIQUE_ID,
+    PROP_JOB_STATUS,
+    PROP_KNOCKOFF,
+)
+
+CCCD_UUID: Final = "00002902-0000-1000-8000-00805f9b34fb"

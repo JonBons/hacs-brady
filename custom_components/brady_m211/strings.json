@@ -43,7 +43,8 @@
       "printable_width": { "name": "Printable width" },
       "printable_height": { "name": "Printable height" },
       "job_status": { "name": "Last job" },
-      "cartridge_id": { "name": "Cartridge id" }
+      "cartridge_id": { "name": "Cartridge id" },
+      "knockoff_count": { "name": "Knockoff count" }
     },
     "binary_sensor": {
       "connected": { "name": "Connected" },
@@ -52,7 +53,10 @@
       "cut_error": { "name": "Cutter error" },
       "print_job_error": { "name": "Print job error" },
       "ac_power": { "name": "Charging" },
-      "die_cut": { "name": "Die-cut media" }
+      "die_cut": { "name": "Die-cut media" },
+      "media_invalid": { "name": "Invalid media" },
+      "media_low": { "name": "Media empty" },
+      "low_power": { "name": "Battery too low" }
     },
     "button": {
       "feed": { "name": "Feed" },

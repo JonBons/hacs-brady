@@ -19,10 +19,13 @@ from bleak_retry_connector import BleakClientWithServiceCache, establish_connect
 
 from .const import (
     APOLLO_SERVICE_UUID,
+    CCCD_UUID,
     CHAR_PICL_REQUEST,
     CHAR_PICL_RESPONSE,
     CHAR_PRINT_JOB,
     CHAR_SESSION_ID,
+    CHUNK_FLAG_FLUSH,
+    CHUNK_FLAG_LAST,
     PROP_CUT,
     PROP_FEED,
 )
@@ -39,10 +42,12 @@ from .protocol import (
     BradyOwnershipError,
     BradyProtocolError,
     PiclAssembler,
+    build_get_packet,
     build_session_payload,
     build_set_packet,
     build_subscribe_packet,
     chunk_payload_size,
+    chunk_write_with_response,
     extract_picl_json,
     iter_chunks,
     parse_picl_notification,
@@ -53,12 +58,15 @@ _LOGGER = logging.getLogger(__name__)
 
 _STATUS_WAIT_S = 12.0
 _PRINT_WAIT_S = 90.0
-_CHUNK_PAUSE_S = 0.01
-_GATT_RETRY_S = 0.1
-_GATT_RETRY_COUNT = 8
-_SESSION_SETTLE_S = 0.05
+_FLUSH_PAUSE_S = 0.01
+_CHUNK_RETRY_S = 0.1
+_CHUNK_RESOURCE_S = 5.0
+_CHUNK_MAX_RETRIES = 10
+_PICL_SUBSCRIBE_WAIT_S = 5.0
 _APOLLO_WAIT_S = 6.0
 _APOLLO_POLL_S = 0.5
+_REQUESTED_MTU = 517
+_MIN_MTU = 50
 
 
 def _error_text(err: BaseException) -> str:
@@ -183,35 +191,6 @@ async def _write_char(
         await client.write_gatt_char(characteristic, data, response=other)
 
 
-async def _write_char_retry(
-    client: BleakClient,
-    char_uuid: str,
-    data: bytes,
-    *,
-    response: bool | None = None,
-) -> None:
-    """Retry ATT 0x11 (Insufficient Resource) with a short delay, as the Android app does."""
-    last_error: BleakError | None = None
-    for attempt in range(1, _GATT_RETRY_COUNT + 1):
-        try:
-            await _write_char(client, char_uuid, data, response=response)
-            return
-        except BleakError as err:
-            last_error = err
-            if not _is_insufficient_resource(err):
-                raise
-            _LOGGER.warning(
-                "GATT insufficient resource on %s attempt %s/%s; waiting %ss",
-                char_label(char_uuid),
-                attempt,
-                _GATT_RETRY_COUNT,
-                _GATT_RETRY_S,
-            )
-            await asyncio.sleep(_GATT_RETRY_S)
-    assert last_error is not None
-    raise last_error
-
-
 class BradyM211Client:
     """Connect, own, subscribe, print, feed, and cut an M211."""
 
@@ -226,7 +205,7 @@ class BradyM211Client:
         self.ownership_id: str | None = None
         self._released = True
         self._picl = PiclAssembler()
-        self._picl_subscribed = False
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -266,7 +245,7 @@ class BradyM211Client:
             )
             self._disconnected.clear()
             self._picl.reset()
-            self._picl_subscribed = False
+            self._loop = asyncio.get_running_loop()
             client = await self._establish_apollo(ble_device, name)
             self._client = client
             log_verbose(
@@ -281,16 +260,17 @@ class BradyM211Client:
             except Exception:
                 _LOGGER.debug("Could not dump GATT map", exc_info=True)
             try:
-                notify_ok = await self._start_picl_indicate(client, required=False)
+                # Android: CCCD indicate → RequestMtu(517) → session → compact subscribe.
+                await self._start_picl_indicate(client, required=True)
+                await self._try_request_mtu(client)
                 guid, first_claim = self._resolve_guid(ownership_id)
                 await self._claim_session(client, guid, first_claim)
-                await asyncio.sleep(_SESSION_SETTLE_S)
-                if not notify_ok:
-                    await self._start_picl_indicate(client, required=True)
+                await self._bootstrap_picl()
                 log_verbose(
                     _LOGGER,
-                    "Session claimed ownership_id=%s",
+                    "Session claimed ownership_id=%s picl_keys=%s",
                     self.ownership_id,
+                    sorted(self._properties),
                 )
             except BleakError as err:
                 _LOGGER.exception("Failed to claim M211 GATT session (%s)", err)
@@ -303,7 +283,7 @@ class BradyM211Client:
                     ) from err
                 raise BradyProtocolError(f"M211 GATT error during connect: {err}") from err
             except BradyProtocolError:
-                await self._disconnect_unlocked(release=False)
+                await self._disconnect_unlocked(release=True)
                 raise
             except Exception:
                 _LOGGER.exception("Unexpected error while connecting to M211")
@@ -319,30 +299,58 @@ class BradyM211Client:
         log_verbose(_LOGGER, "Refreshing PICL status (timeout=%ss)", timeout)
         async with self._lock:
             self._ensure_connected()
-            if self._picl_subscribed and self._properties:
+            if self._properties:
                 return self.status
-            self._status_event.clear()
-            if not self._picl_subscribed:
-                await self._write_chunked(CHAR_PICL_REQUEST, build_subscribe_packet())
-                self._picl_subscribed = True
-        try:
-            async with asyncio.timeout(timeout):
-                await self._status_event.wait()
-        except TimeoutError:
+            await self._bootstrap_picl(required=False, wait_s=timeout)
+        if self._properties:
+            log_verbose(_LOGGER, "PICL status received: %s", self._status_summary())
+        else:
             if self._picl.buffered:
                 _LOGGER.warning(
-                    "Timed out with %s PICL bytes still buffered; discarding",
+                    "No complete PICL packet; discarding %s buffered bytes",
                     self._picl.buffered,
                 )
                 self._picl.reset()
             _LOGGER.warning(
-                "Timed out waiting for PICL status after %ss; using cached values %s",
-                timeout,
+                "No PICL status after subscribe/GET (buffered=%s); "
+                "using cached values %s. No indications usually means CCCD "
+                "indicate is off or the subscribe write did not land.",
+                self._picl.buffered,
                 self._properties,
             )
-        else:
-            log_verbose(_LOGGER, "PICL status received: %s", self._status_summary())
         return self.status
+
+    async def _bootstrap_picl(
+        self, *, required: bool = True, wait_s: float = _PICL_SUBSCRIBE_WAIT_S
+    ) -> None:
+        """Subscribe like Express Labels, then GET if the printer stays silent."""
+        log_verbose(_LOGGER, "Sending PICL subscribe")
+        self._status_event.clear()
+        await self._write_chunked(CHAR_PICL_REQUEST, build_subscribe_packet())
+        try:
+            async with asyncio.timeout(wait_s):
+                await self._status_event.wait()
+            return
+        except TimeoutError:
+            _LOGGER.warning(
+                "No PICL indication %ss after subscribe (buffered=%s); sending GET",
+                wait_s,
+                self._picl.buffered,
+            )
+        log_verbose(_LOGGER, "Sending PICL property get")
+        self._status_event.clear()
+        await self._write_chunked(CHAR_PICL_REQUEST, build_get_packet())
+        try:
+            async with asyncio.timeout(wait_s):
+                await self._status_event.wait()
+        except TimeoutError:
+            message = (
+                f"M211 sent no PICL indications after subscribe/GET "
+                f"(buffered={self._picl.buffered}). CCCD indicate may not be armed."
+            )
+            if required:
+                raise BradyProtocolError(message) from None
+            _LOGGER.warning("%s", message)
 
     async def feed(self) -> None:
         log_verbose(_LOGGER, "Sending PICL feed")
@@ -370,6 +378,9 @@ class BradyM211Client:
         )
         async with self._lock:
             self._ensure_connected()
+            blocked = self.status.print_blocked_reason()
+            if blocked:
+                raise BradyProtocolError(f"M211 cannot print: {blocked}")
             self._job_event.clear()
             self._properties.pop("0029", None)
             await self._write_chunked(CHAR_PRINT_JOB, payload)
@@ -450,6 +461,64 @@ class BradyM211Client:
                 )
         assert last_error is not None
         raise last_error
+
+    async def _try_request_mtu(self, client: BleakClient) -> None:
+        """Android RequestMtu(517). Skip silently if the host stack cannot exchange MTU."""
+        backend = getattr(client, "_backend", None)
+        attempted = False
+        for obj in (client, backend):
+            if obj is None:
+                continue
+            for name, args in (("_acquire_mtu", ()), ("exchange_mtu", (_REQUESTED_MTU,))):
+                method = getattr(obj, name, None)
+                if not callable(method):
+                    continue
+                attempted = True
+                try:
+                    result = method(*args)
+                    if asyncio.iscoroutine(result):
+                        await result
+                    log_verbose(
+                        _LOGGER,
+                        "MTU after %s: %s (requested %s)",
+                        name,
+                        _resolved_mtu(client),
+                        _REQUESTED_MTU,
+                    )
+                    break
+                except TypeError:
+                    try:
+                        result = method(_REQUESTED_MTU) if not args else method()
+                        if asyncio.iscoroutine(result):
+                            await result
+                        log_verbose(
+                            _LOGGER,
+                            "MTU after %s: %s (requested %s)",
+                            name,
+                            _resolved_mtu(client),
+                            _REQUESTED_MTU,
+                        )
+                        break
+                    except Exception as err:
+                        _LOGGER.debug("MTU %s failed: %s", name, err)
+                except Exception as err:
+                    _LOGGER.debug("MTU %s failed: %s", name, err)
+            else:
+                continue
+            break
+        mtu = _resolved_mtu(client)
+        if mtu < _MIN_MTU:
+            _LOGGER.warning(
+                "Negotiated MTU %s is below Android's minimum of %s",
+                mtu,
+                _MIN_MTU,
+            )
+        elif not attempted:
+            log_verbose(
+                _LOGGER,
+                "Stack has no MTU request API; using negotiated MTU %s",
+                mtu,
+            )
 
     async def _establish_apollo(self, ble_device: BLEDevice, name: str) -> BleakClient:
         """Connect and wait until Brady Apollo characteristics exist (not just GAP)."""
@@ -556,7 +625,34 @@ class BradyM211Client:
             list(characteristic.properties or ()),
         )
         await client.start_notify(characteristic, self._on_picl)
+        await self._enable_picl_cccd(client, characteristic)
         return True
+
+    async def _enable_picl_cccd(self, client: BleakClient, characteristic: Any) -> None:
+        """Android uses CCCD 0x0002 (indicate). Also try notify if indicate is rejected."""
+        descriptor = None
+        for item in getattr(characteristic, "descriptors", ()) or ():
+            if str(item.uuid).lower().startswith("00002902"):
+                descriptor = item
+                break
+        if descriptor is None:
+            _LOGGER.warning(
+                "PICL response has no CCCD %s; relying on start_notify only",
+                CCCD_UUID,
+            )
+            return
+        for label, payload in (("indicate", b"\x02\x00"), ("notify", b"\x01\x00")):
+            try:
+                await client.write_gatt_descriptor(descriptor, payload)
+                log_verbose(
+                    _LOGGER,
+                    "Wrote PICL CCCD %s %s",
+                    label,
+                    payload.hex(),
+                )
+                return
+            except BleakError as err:
+                _LOGGER.warning("PICL CCCD %s write failed: %s", label, err)
 
     async def _rediscover_services(self, client: BleakClient) -> None:
         getter = getattr(client, "get_services", None)
@@ -614,18 +710,22 @@ class BradyM211Client:
             self.mtu_size,
         )
         noisy_chunks = char_uuid.lower() != CHAR_PRINT_JOB.lower()
-        for index, chunk in enumerate(chunks, start=1):
+        checkpoint = 0
+        index = 0
+        retries = 0
+        while index < len(chunks):
+            chunk = chunks[index]
             flag = chunk[0]
             seq = int.from_bytes(chunk[1:3], "little")
-            message = (
-                "GATT write %s chunk %s/%s flag=%s seq=%s %s"
-            )
+            use_response = chunk_write_with_response(flag, seq, retrying=retries > 0)
+            message = "GATT write %s chunk %s/%s flag=%s seq=%s response=%s %s"
             args = (
                 char_label(char_uuid),
-                index,
+                index + 1,
                 len(chunks),
                 flag_label(flag),
                 seq,
+                use_response,
                 format_bytes(chunk, limit=48 if noisy_chunks else 24),
             )
             if noisy_chunks:
@@ -633,22 +733,53 @@ class BradyM211Client:
             else:
                 _LOGGER.debug(message, *args)
             try:
-                await _write_char_retry(
-                    self._client, char_uuid, chunk, response=False
+                await _write_char(
+                    self._client, char_uuid, chunk, response=use_response
                 )
             except BleakError as err:
-                _LOGGER.exception(
-                    "GATT write failed on %s chunk %s/%s flag=%s seq=%s",
+                if _is_insufficient_resource(err):
+                    _LOGGER.warning(
+                        "GATT 0x11 on %s chunk %s; rewind to checkpoint %s after %ss",
+                        char_label(char_uuid),
+                        index + 1,
+                        checkpoint + 1,
+                        _CHUNK_RESOURCE_S,
+                    )
+                    await asyncio.sleep(_CHUNK_RESOURCE_S)
+                    index = checkpoint
+                    continue
+                retries += 1
+                if retries > _CHUNK_MAX_RETRIES:
+                    _LOGGER.exception(
+                        "GATT write failed on %s chunk %s/%s flag=%s seq=%s",
+                        char_label(char_uuid),
+                        index + 1,
+                        len(chunks),
+                        flag_label(flag),
+                        seq,
+                    )
+                    raise BradyProtocolError(
+                        f"GATT write failed on {char_label(char_uuid)}: {err}"
+                    ) from err
+                _LOGGER.warning(
+                    "GATT write failed on %s chunk %s (%s); rewind retry %s/%s",
                     char_label(char_uuid),
-                    index,
-                    len(chunks),
-                    flag_label(flag),
-                    seq,
+                    index + 1,
+                    err,
+                    retries,
+                    _CHUNK_MAX_RETRIES,
                 )
-                raise BradyProtocolError(
-                    f"GATT write failed on {char_label(char_uuid)}: {err}"
-                ) from err
-            await asyncio.sleep(_CHUNK_PAUSE_S)
+                await asyncio.sleep(_CHUNK_RETRY_S)
+                index = checkpoint
+                continue
+            if flag == CHUNK_FLAG_FLUSH:
+                checkpoint = index + 1
+                await asyncio.sleep(_FLUSH_PAUSE_S)
+            elif flag == CHUNK_FLAG_LAST:
+                checkpoint = index + 1
+            if retries > 0:
+                retries -= 1
+            index += 1
         if not noisy_chunks:
             log_verbose(
                 _LOGGER,
@@ -659,6 +790,13 @@ class BradyM211Client:
 
     def _on_picl(self, _char: Any, data: bytearray) -> None:
         raw = bytes(data)
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._apply_picl, raw)
+        else:
+            self._apply_picl(raw)
+
+    def _apply_picl(self, raw: bytes) -> None:
         packets = self._picl.feed(raw)
         if not packets:
             log_verbose(
@@ -692,7 +830,6 @@ class BradyM211Client:
     def _on_disconnect(self, _client: BleakClient) -> None:
         log_verbose(_LOGGER, "M211 BLE disconnect callback fired")
         self._picl.reset()
-        self._picl_subscribed = False
         self._disconnected.set()
 
     async def _disconnect_unlocked(self, *, release: bool) -> None:

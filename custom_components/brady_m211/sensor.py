@@ -73,6 +73,13 @@ SENSORS: tuple[M211SensorDescription, ...] = (
         value_fn=lambda s: s.unique_id,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+    M211SensorDescription(
+        key="knockoff_count",
+        translation_key="knockoff_count",
+        value_fn=lambda s: s.knockoff_count,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
 )
 
 

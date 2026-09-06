@@ -14,6 +14,7 @@ from .const import (
     CHUNK_HEADER_BYTES,
     COMPACT_PICL_GUID,
     FLUSH_EVERY_BYTES,
+    M211_GET_IDS,
     M211_SUBSCRIBE_IDS,
 )
 
@@ -58,8 +59,8 @@ def build_session_payload(guid: uuid.UUID, first_claim: bool) -> bytes:
 
 
 def release_session_payload() -> bytes:
-    """Zeros that drop HA ownership so another client can claim the printer."""
-    return bytes(17)
+    """Guid.Empty.ToByteArray() as used by Express Labels on disconnect."""
+    return bytes(16)
 
 
 def chunk_payload_size(mtu_size: int) -> int:
@@ -110,6 +111,11 @@ def iter_chunks(
             since_flush += take
 
 
+def chunk_write_with_response(flags: int, seq: int, *, retrying: bool = False) -> bool:
+    """Match Android: write-with-response on seq 0, FLUSH, LAST, and retries."""
+    return retrying or seq == 0 or flags in (CHUNK_FLAG_FLUSH, CHUNK_FLAG_LAST)
+
+
 def build_picl_packet(json_body: str) -> bytes:
     """Wrap Compact PICL JSON: GUID + little-endian length + UTF-8 JSON."""
     encoded = json_body.encode("utf-8")
@@ -124,10 +130,19 @@ def build_subscribe_packet(property_ids: tuple[str, ...] = M211_SUBSCRIBE_IDS) -
     return build_picl_packet(json.dumps(body, separators=(",", ":")))
 
 
-def build_set_packet(property_id: str, value: str) -> bytes:
-    """PropertySetRequests packet used for feed/cut/clear."""
-    body = {"PropertySetRequests": [{"ID": property_id, "Value": value}]}
+def build_get_packet(property_ids: tuple[str, ...] = M211_GET_IDS) -> bytes:
+    """PropertyGetRequests packet to force an immediate Compact PICL dump."""
+    body = {"PropertyGetRequests": [{"ID": prop_id} for prop_id in property_ids]}
     return build_picl_packet(json.dumps(body, separators=(",", ":")))
+
+
+def build_set_packet(prop_id: str, value: str, *, quoted: bool = True) -> bytes:
+    """PropertySetRequests packet (feed, cut, clear errors, timeout)."""
+    if quoted:
+        body = {"PropertySetRequests": [{"ID": prop_id, "Value": value}]}
+        return build_picl_packet(json.dumps(body, separators=(",", ":")))
+    body_text = '{"PropertySetRequests":[{"ID":"' + prop_id + '","Value":' + value + "}]}"
+    return build_picl_packet(body_text)
 
 
 def extract_picl_json(data: bytes) -> str:
