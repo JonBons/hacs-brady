@@ -54,6 +54,85 @@ _PRINT_WAIT_S = 90.0
 _FLUSH_PAUSE_S = 0.01
 
 
+def _is_write_not_permitted(err: BaseException) -> bool:
+    """BlueZ returns ATT 0x03 when the write type does not match the characteristic."""
+    text = str(err).lower()
+    return "write_not_permitted" in text or "write not permitted" in text
+
+
+def _char_properties(client: BleakClient, char_uuid: str) -> list[str]:
+    services = getattr(client, "services", None)
+    if not services:
+        return []
+    characteristic = services.get_characteristic(char_uuid)
+    if characteristic is None:
+        return []
+    return list(characteristic.properties or ())
+
+
+def _preferred_write_response(client: BleakClient, char_uuid: str, default: bool = True) -> bool:
+    props = _char_properties(client, char_uuid)
+    if "write" in props:
+        return True
+    if "write-without-response" in props:
+        return False
+    return default
+
+
+def _resolved_mtu(client: BleakClient | None) -> int:
+    """ATT MTU without touching Bleak's BlueZ ``mtu_size`` property (it warns)."""
+    if client is None:
+        return 23
+    backend = getattr(client, "_backend", None)
+    for obj in (backend, client):
+        if obj is None:
+            continue
+        cached = getattr(obj, "_mtu_size", None)
+        if cached:
+            return int(cached)
+    services = getattr(client, "services", None)
+    if services:
+        for char_uuid in (CHAR_PICL_REQUEST, CHAR_PRINT_JOB, CHAR_SESSION_ID):
+            characteristic = services.get_characteristic(char_uuid)
+            if characteristic is None:
+                continue
+            wwr = int(getattr(characteristic, "max_write_without_response_size", 0) or 0)
+            if wwr:
+                return wwr + 3
+    return 23
+
+
+async def _write_char(
+    client: BleakClient,
+    char_uuid: str,
+    data: bytes,
+    *,
+    response: bool | None = None,
+) -> None:
+    """Write using the characteristic's supported type, then the other on ATT 0x03."""
+    preferred = (
+        _preferred_write_response(client, char_uuid)
+        if response is None
+        else response
+    )
+    try:
+        await client.write_gatt_char(char_uuid, data, response=preferred)
+        return
+    except BleakError as err:
+        if not _is_write_not_permitted(err):
+            raise
+        other = not preferred
+        _LOGGER.warning(
+            "GATT write %s response=%s not permitted (%s); retrying response=%s props=%s",
+            char_label(char_uuid),
+            preferred,
+            err,
+            other,
+            _char_properties(client, char_uuid),
+        )
+        await client.write_gatt_char(char_uuid, data, response=other)
+
+
 class BradyM211Client:
     """Connect, own, subscribe, print, feed, and cut an M211."""
 
@@ -74,9 +153,7 @@ class BradyM211Client:
 
     @property
     def mtu_size(self) -> int:
-        if not self._client:
-            return 23
-        return int(getattr(self._client, "mtu_size", 23) or 23)
+        return _resolved_mtu(self._client)
 
     @property
     def status(self) -> PrinterStatus:
@@ -118,7 +195,7 @@ class BradyM211Client:
             log_verbose(
                 _LOGGER,
                 "GATT up mtu=%s connected=%s %s",
-                getattr(client, "mtu_size", None),
+                _resolved_mtu(client),
                 client.is_connected,
                 describe_ble_device(ble_device),
             )
@@ -134,22 +211,7 @@ class BradyM211Client:
                 )
                 await client.start_notify(CHAR_PICL_RESPONSE, self._on_picl)
                 guid, first_claim = self._resolve_guid(ownership_id)
-                session = build_session_payload(guid, first_claim)
-                log_verbose(
-                    _LOGGER,
-                    "Writing %s guid=%s first_claim=%s %s",
-                    char_label(CHAR_SESSION_ID),
-                    guid,
-                    first_claim,
-                    format_bytes(session),
-                )
-                await client.write_gatt_char(
-                    CHAR_SESSION_ID,
-                    session,
-                    response=True,
-                )
-                self.ownership_id = str(guid)
-                self._released = False
+                await self._claim_session(client, guid, first_claim)
                 log_verbose(
                     _LOGGER,
                     "Session claimed ownership_id=%s; sending PICL subscribe",
@@ -158,15 +220,16 @@ class BradyM211Client:
                 await self._write_chunked(CHAR_PICL_REQUEST, build_subscribe_packet())
             except BleakError as err:
                 _LOGGER.exception(
-                    "Failed to claim M211 GATT session (%s). Printer may be owned "
-                    "by another device.",
+                    "Failed to claim M211 GATT session (%s). Session writes that "
+                    "return Write Not Permitted are often the wrong GATT write "
+                    "type; ownership conflicts are usually Android status 19.",
                     err,
                 )
                 await self._disconnect_unlocked(release=False)
                 raise BradyOwnershipError(
-                    "Could not claim the M211. If the Bluetooth LED is solid, "
-                    "hold the power button for 5 seconds to release the other "
-                    f"device, then try again. ({err})"
+                    "Could not claim the M211. Close the Brady phone app, and if "
+                    "the Bluetooth LED is solid, hold power for 5 seconds until it "
+                    f"pulses, then reload this integration. ({err})"
                 ) from err
             except Exception:
                 _LOGGER.exception("Unexpected error while connecting to M211")
@@ -265,10 +328,44 @@ class BradyM211Client:
         stored = ownership_id or self.ownership_id
         if stored:
             try:
-                return uuid.UUID(stored), self._released
+                # Reuse the saved GUID with flag 0x00 (Web SDK / reconnect).
+                return uuid.UUID(stored), False
             except ValueError:
                 _LOGGER.warning("Ignoring invalid stored ownership id %r", stored)
         return uuid.uuid4(), True
+
+    async def _claim_session(
+        self, client: BleakClient, guid: uuid.UUID, first_claim: bool
+    ) -> None:
+        """Write Session ID, retrying flag and write-type if BlueZ returns ATT 0x03."""
+        last_error: BleakError | None = None
+        for claim in (first_claim, not first_claim):
+            payload = build_session_payload(guid, claim)
+            log_verbose(
+                _LOGGER,
+                "Writing %s guid=%s first_claim=%s props=%s %s",
+                char_label(CHAR_SESSION_ID),
+                guid,
+                claim,
+                _char_properties(client, CHAR_SESSION_ID),
+                format_bytes(payload),
+            )
+            try:
+                await _write_char(client, CHAR_SESSION_ID, payload)
+                self.ownership_id = str(guid)
+                self._released = False
+                return
+            except BleakError as err:
+                last_error = err
+                if not _is_write_not_permitted(err):
+                    raise
+                _LOGGER.warning(
+                    "Session write first_claim=%s failed with write-not-permitted: %s",
+                    claim,
+                    err,
+                )
+        assert last_error is not None
+        raise last_error
 
     def _ensure_connected(self) -> None:
         if not self.is_connected or self._client is None:
@@ -336,7 +433,7 @@ class BradyM211Client:
             else:
                 _LOGGER.debug(message, *args)
             try:
-                await self._client.write_gatt_char(char_uuid, chunk, response=True)
+                await _write_char(self._client, char_uuid, chunk)
             except BleakError:
                 _LOGGER.exception(
                     "GATT write failed on %s chunk %s/%s flag=%s seq=%s",
@@ -406,9 +503,7 @@ class BradyM211Client:
                         "Writing session release %s",
                         format_bytes(payload),
                     )
-                    await client.write_gatt_char(
-                        CHAR_SESSION_ID, payload, response=True
-                    )
+                    await _write_char(client, CHAR_SESSION_ID, payload)
                     self._released = True
                 except BleakError:
                     _LOGGER.warning("Failed to release M211 ownership", exc_info=True)
