@@ -98,6 +98,22 @@ def _is_disconnect_noise(err: BaseException) -> bool:
     return "unlikely" in text or "not connected" in text or "disconnected" in text
 
 
+def _is_services_missing(err: BaseException) -> bool:
+    return "service discovery has not been performed" in _error_text(err)
+
+
+def _gatt_services(client: BleakClient) -> Any:
+    """Bleak 3 raises if discovery has not run; never let that escape lookup helpers."""
+    backend = getattr(client, "_backend", None)
+    services = getattr(backend, "services", None) if backend is not None else None
+    if services:
+        return services
+    try:
+        return client.services
+    except BleakError:
+        return None
+
+
 def _char_properties(client: BleakClient, char_uuid: str) -> list[str]:
     characteristic = _find_characteristic(client, char_uuid)
     if characteristic is None:
@@ -106,7 +122,7 @@ def _char_properties(client: BleakClient, char_uuid: str) -> list[str]:
 
 
 def _find_characteristic(client: BleakClient, char_uuid: str) -> Any:
-    services = getattr(client, "services", None)
+    services = _gatt_services(client)
     if not services:
         return None
     characteristic = services.get_characteristic(char_uuid)
@@ -121,7 +137,7 @@ def _find_characteristic(client: BleakClient, char_uuid: str) -> Any:
 
 
 def _listed_char_uuids(client: BleakClient) -> list[str]:
-    services = getattr(client, "services", None)
+    services = _gatt_services(client)
     if not services:
         return []
     return [
@@ -150,7 +166,7 @@ def _resolved_mtu(client: BleakClient | None) -> int:
         cached = getattr(obj, "_mtu_size", None)
         if cached:
             return int(cached)
-    services = getattr(client, "services", None)
+    services = _gatt_services(client)
     if services:
         for char_uuid in (CHAR_PICL_REQUEST, CHAR_PRINT_JOB, CHAR_SESSION_ID):
             characteristic = services.get_characteristic(char_uuid)
@@ -169,8 +185,14 @@ async def _write_char(
     *,
     response: bool | None = None,
 ) -> None:
-    """Write without response first; fall back if the stack rejects that type."""
-    preferred = False if response is None else response
+    """Write GATT; BlueZ Apollo chars advertise both write types but reject Write Request."""
+    props = _char_properties(client, char_uuid)
+    if response is None:
+        preferred = False
+    elif response and "write-without-response" in props:
+        preferred = False
+    else:
+        preferred = bool(response)
     characteristic = _find_characteristic(client, char_uuid) or char_uuid
     try:
         await client.write_gatt_char(characteristic, data, response=preferred)
@@ -259,13 +281,14 @@ class BradyM211Client:
             except Exception:
                 _LOGGER.debug("Could not dump GATT map", exc_info=True)
             try:
-                # Android: CCCD indicate → MTU → session → compact subscribe.
-                # Bleak 3+ forbids writing CCCD 0x2902; start_notify arms indicate/notify.
-                await self._start_picl_indicate(client, required=True)
+                # Session can trigger GATT Service Changed on BlueZ, which drops
+                # StartNotify. Arm PICL after the session is claimed.
                 await self._try_request_mtu(client)
                 guid, first_claim = self._resolve_guid(ownership_id)
                 await self._claim_session(client, guid, first_claim)
-                await self._bootstrap_picl()
+                await self._wait_for_apollo(client)
+                await self._start_picl_indicate(client, required=True)
+                await self._bootstrap_picl(required=False)
                 log_verbose(
                     _LOGGER,
                     "Session claimed ownership_id=%s picl_keys=%s",
@@ -605,14 +628,7 @@ class BradyM211Client:
         if characteristic is None:
             message = (
                 "PICL response characteristic %s not in GATT map: %s"
-                % (
-                    CHAR_PICL_RESPONSE,
-                    [
-                        str(item.uuid)
-                        for service in (client.services or [])
-                        for item in service.characteristics
-                    ],
-                )
+                % (CHAR_PICL_RESPONSE, _listed_char_uuids(client))
             )
             if required:
                 raise BradyProtocolError(message)
@@ -620,21 +636,41 @@ class BradyM211Client:
             return False
         log_verbose(
             _LOGGER,
-            "start_notify %s props=%s (Bleak writes CCCD; direct 0x2902 writes are forbidden)",
+            "start_notify %s props=%s",
             char_label(CHAR_PICL_RESPONSE),
             list(characteristic.properties or ()),
         )
-        await client.start_notify(characteristic, self._on_picl)
+        try:
+            await client.start_notify(characteristic, self._on_picl)
+        except BleakError as err:
+            if "already" in _error_text(err):
+                log_verbose(_LOGGER, "PICL notifications already armed")
+            else:
+                raise
         return True
 
     async def _rediscover_services(self, client: BleakClient) -> None:
         getter = getattr(client, "get_services", None)
+        if not callable(getter):
+            getter = getattr(getattr(client, "_backend", None), "get_services", None)
         if not callable(getter):
             return
         try:
             await getter(dangerous_use_bleak_cache=False)
         except TypeError:
             await getter()
+        except BleakError:
+            _LOGGER.debug("get_services failed", exc_info=True)
+
+    async def _ensure_services(self) -> None:
+        client = self._client
+        if client is None:
+            return
+        if _gatt_services(client) and _has_apollo(client):
+            return
+        await self._rediscover_services(client)
+        if not _has_apollo(client):
+            await self._wait_for_apollo(client)
 
     def _ensure_connected(self) -> None:
         if not self.is_connected or self._client is None:
@@ -650,7 +686,7 @@ class BradyM211Client:
         )
 
     def _log_gatt_map(self, client: BleakClient) -> None:
-        services = getattr(client, "services", None)
+        services = _gatt_services(client)
         if not services:
             _LOGGER.warning("No GATT services on M211 after connect")
             return
@@ -683,6 +719,7 @@ class BradyM211Client:
             self.mtu_size,
         )
         noisy_chunks = char_uuid.lower() != CHAR_PRINT_JOB.lower()
+        await self._ensure_services()
         checkpoint = 0
         index = 0
         retries = 0
@@ -710,6 +747,18 @@ class BradyM211Client:
                     self._client, char_uuid, chunk, response=use_response
                 )
             except BleakError as err:
+                if _is_services_missing(err):
+                    _LOGGER.warning(
+                        "GATT cache empty on %s; rediscovering services",
+                        char_label(char_uuid),
+                    )
+                    await self._ensure_services()
+                    retries += 1
+                    if retries > _CHUNK_MAX_RETRIES or not _gatt_services(self._client):
+                        raise BradyProtocolError(
+                            f"GATT write failed on {char_label(char_uuid)}: {err}"
+                        ) from err
+                    continue
                 if _is_insufficient_resource(err):
                     _LOGGER.warning(
                         "GATT 0x11 on %s chunk %s; rewind to checkpoint %s after %ss",
